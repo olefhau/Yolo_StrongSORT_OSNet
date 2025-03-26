@@ -1,146 +1,184 @@
 import argparse
-
 import os
-# limit the number of cpus used by high performance libraries
+import sys
+from pathlib import Path
+import numpy as np
+import torch
+import torch.backends.cudnn as cudnn
+from numpy import random
+from PIL import Image
+from ultralytics import YOLO  # Use ultralytics for YOLO model inference
+import cv2
+
+# Limit the number of CPUs used by high-performance libraries
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
 os.environ["NUMEXPR_NUM_THREADS"] = "1"
 
-import sys
-import numpy as np
-from pathlib import Path
-import torch
-import torch.backends.cudnn as cudnn
-from numpy import random
-from PIL import Image
-
 FILE = Path(__file__).resolve()
-ROOT = FILE.parents[0]  # yolov5 strongsort root directory
+ROOT = FILE.parents[0]  # Root directory
 WEIGHTS = ROOT / 'weights'
 
 if str(ROOT) not in sys.path:
-    sys.path.append(str(ROOT))  # add ROOT to PATH
-if str(ROOT / 'yolov7') not in sys.path:
-    sys.path.append(str(ROOT / 'yolov7'))  # add yolov5 ROOT to PATH
+    sys.path.append(str(ROOT))  # Add ROOT to PATH
 if str(ROOT / 'strong_sort') not in sys.path:
-    sys.path.append(str(ROOT / 'strong_sort'))  # add strong_sort ROOT to PATH
-ROOT = Path(os.path.relpath(ROOT, Path.cwd()))  # relative
+    sys.path.append(str(ROOT / 'strong_sort'))  # Add strong_sort ROOT to PATH
+ROOT = Path(os.path.relpath(ROOT, Path.cwd()))  # Relative path
 
-
-from yolov7.models.experimental import attempt_load
-from yolov7.utils.datasets import LoadImages, LoadStreams
-from yolov7.utils.general import (check_img_size, non_max_suppression, scale_coords, check_requirements, cv2,
-                                  check_imshow, xyxy2xywh, xywh2xyxy, clip_coords, increment_path, strip_optimizer, colorstr, check_file)
-from yolov7.utils.torch_utils import select_device, time_synchronized
-from yolov7.utils.plots import plot_one_box
 from strong_sort.utils.parser import get_config
 from strong_sort.strong_sort import StrongSORT
 
 
-# method from [https://github.com/WongKinYiu/yolov7/blob/u5/utils/plots.py#L474] for availabling '--save-crop' argument
+# Method for saving cropped images
 def save_one_box(xyxy, im, file=Path('im.jpg'), gain=1.02, pad=10, square=False, BGR=False, save=True):
-    # Save image crop as {file} with crop size multiple {gain} and {pad} pixels. Save and/or return crop
     xyxy = torch.tensor(xyxy).view(-1, 4)
-    b = xyxy2xywh(xyxy)  # boxes
+    b = xyxy2xywh(xyxy)  # Convert to xywh format
     if square:
-        b[:, 2:] = b[:, 2:].max(1)[0].unsqueeze(1)  # attempt rectangle to square
-    b[:, 2:] = b[:, 2:] * gain + pad  # box wh * gain + pad
+        b[:, 2:] = b[:, 2:].max(1)[0].unsqueeze(1)  # Make square
+    b[:, 2:] = b[:, 2:] * gain + pad  # Apply gain and padding
     xyxy = xywh2xyxy(b).long()
     clip_coords(xyxy, im.shape)
     crop = im[int(xyxy[0, 1]):int(xyxy[0, 3]), int(xyxy[0, 0]):int(xyxy[0, 2]), ::(1 if BGR else -1)]
     if save:
-        file.parent.mkdir(parents=True, exist_ok=True)  # make directory
-        f = str(Path(increment_path(file)).with_suffix('.jpg'))
-        # cv2.imwrite(f, crop)  # https://github.com/ultralytics/yolov5/issues/7007 chroma subsampling issue
-        Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)).save(f, quality=95, subsampling=0)
+        file.parent.mkdir(parents=True, exist_ok=True)  # Create directory
+        f = str(Path(file).with_suffix('.jpg'))
+        Image.fromarray(crop).save(f, quality=95, subsampling=0)
     return crop
 
-VID_FORMATS = 'asf', 'avi', 'gif', 'm4v', 'mkv', 'mov', 'mp4', 'mpeg', 'mpg', 'ts', 'wmv'  # include video suffixes
+
+def scale_coords(img1_shape, coords, img0_shape, ratio_pad=None):
+    """
+    Rescale coordinates (x1, y1, x2, y2) from the model's input image size to the original image size.
+    Args:
+        img1_shape (tuple): Shape of the model's input image (height, width).
+        coords (torch.Tensor): Bounding box coordinates in the format (x1, y1, x2, y2).
+        img0_shape (tuple): Shape of the original image (height, width).
+        ratio_pad (tuple): Optional ratio and padding values (ratio, (pad_x, pad_y)).
+    Returns:
+        torch.Tensor: Rescaled bounding box coordinates.
+    """
+    if ratio_pad is None:  # Calculate from shapes
+        gain = min(img1_shape[0] / img0_shape[0], img1_shape[1] / img0_shape[1])  # Gain (wh ratio)
+        pad = (img1_shape[1] - img0_shape[1] * gain) / 2, (img1_shape[0] - img0_shape[0] * gain) / 2  # Wh padding
+    else:
+        gain = ratio_pad[0]
+        pad = ratio_pad[1]
+
+    # Perform out-of-place operations
+    coords = coords.clone()  # Clone the tensor to avoid in-place operations
+    coords[:, [0, 2]] = coords[:, [0, 2]] - pad[0]  # x padding
+    coords[:, [1, 3]] = coords[:, [1, 3]] - pad[1]  # y padding
+    coords[:, :4] = coords[:, :4] / gain
+    coords[:, :4] = coords[:, :4].clamp(0, max(img0_shape))  # Clip coordinates to image size
+    return coords
+
+def xyxy2xywh(x):
+    """
+    Convert bounding box format from [x1, y1, x2, y2] to [x_center, y_center, width, height].
+    Args:
+        x (torch.Tensor): Bounding box coordinates in [x1, y1, x2, y2] format.
+    Returns:
+        torch.Tensor: Bounding box coordinates in [x_center, y_center, width, height] format.
+    """
+    y = x.clone() if isinstance(x, torch.Tensor) else np.copy(x)
+    y[:, 0] = (x[:, 0] + x[:, 2]) / 2  # x_center
+    y[:, 1] = (x[:, 1] + x[:, 3]) / 2  # y_center
+    y[:, 2] = x[:, 2] - x[:, 0]  # width
+    y[:, 3] = x[:, 3] - x[:, 1]  # height
+    return y
+
+def plot_one_box(x, img, color=(255, 0, 0), label=None, line_thickness=3):
+    """
+    Draws a single bounding box on an image.
+    Args:
+        x (list or np.ndarray): Bounding box coordinates in [x1, y1, x2, y2] format.
+        img (np.ndarray): Image on which to draw the bounding box.
+        color (tuple): Color of the bounding box in (B, G, R) format.
+        label (str): Optional label to display on the bounding box.
+        line_thickness (int): Thickness of the bounding box lines.
+    """
+    # Convert coordinates to integers
+    x1, y1, x2, y2 = map(int, x)
+    # Draw the rectangle
+    cv2.rectangle(img, (x1, y1), (x2, y2), color, thickness=line_thickness)
+    # Add label if provided
+    if label:
+        font_scale = max(0.5, line_thickness / 3)
+        font_thickness = max(1, line_thickness // 3)
+        t_size = cv2.getTextSize(label, 0, font_scale, font_thickness)[0]
+        label_y1 = max(y1 - t_size[1] - 3, 0)
+        label_y2 = y1
+        label_x1 = x1
+        label_x2 = x1 + t_size[0] + 3
+        cv2.rectangle(img, (label_x1, label_y1), (label_x2, label_y2), color, -1)  # Filled rectangle for label
+        cv2.putText(img, label, (x1, y1 - 2), 0, font_scale, (255, 255, 255), thickness=font_thickness, lineType=cv2.LINE_AA)
+
+VID_FORMATS = ('asf', 'avi', 'gif', 'm4v', 'mkv', 'mov', 'mp4', 'mpeg', 'mpg', 'ts', 'wmv')  # Video formats
 
 
 @torch.no_grad()
 def run(
         source='0',
-        yolo_weights=WEIGHTS / 'yolov5m.pt',  # model.pt path(s),
-        strong_sort_weights=WEIGHTS / 'osnet_x0_25_msmt17.pt',  # model.pt path,
+        yolo_model='yolov8s.pt',  # Specify the YOLO model name (e.g., yolov8n.pt, yolov8s.pt)
+        strong_sort_weights=WEIGHTS / 'osnet_x0_25_msmt17.pt',  # StrongSORT weights
         config_strongsort=ROOT / 'strong_sort/configs/strong_sort.yaml',
-        imgsz=(640, 640),  # inference size (height, width)
-        conf_thres=0.25,  # confidence threshold
-        iou_thres=0.45,  # NMS IOU threshold
-        max_det=1000,  # maximum detections per image
-        device='',  # cuda device, i.e. 0 or 0,1,2,3 or cpu
-        show_vid=False,  # show results
-        save_txt=False,  # save results to *.txt
-        save_conf=False,  # save confidences in --save-txt labels
-        save_crop=False,  # save cropped prediction boxes
-        save_vid=False,  # save confidences in --save-txt labels
-        nosave=False,  # do not save images/videos
-        classes=None,  # filter by class: --class 0, or --class 0 2 3
-        agnostic_nms=False,  # class-agnostic NMS
-        augment=False,  # augmented inference
-        visualize=False,  # visualize features
-        update=False,  # update all models
-        project=ROOT / 'runs/track',  # save results to project/name
-        name='exp',  # save results to project/name
-        exist_ok=False,  # existing project/name ok, do not increment
-        line_thickness=3,  # bounding box thickness (pixels)
-        hide_labels=False,  # hide labels
-        hide_conf=False,  # hide confidences
-        hide_class=False,  # hide IDs
-        half=False,  # use FP16 half-precision inference
-        dnn=False,  # use OpenCV DNN for ONNX inference
+        imgsz=(640, 640),  # Inference size (height, width)
+        conf_thres=0.25,  # Confidence threshold
+        iou_thres=0.45,  # NMS IoU threshold
+        max_det=1000,  # Maximum detections per image
+        device='',  # CUDA device, i.e., 0 or 0,1,2,3 or CPU
+        show_vid=True,  # Show results
+        save_txt=False,  # Save results to *.txt
+        save_conf=False,  # Save confidences in --save-txt labels
+        save_crop=False,  # Save cropped prediction boxes
+        save_vid=False,  # Save video results
+        nosave=False,  # Do not save images/videos
+        classes=None,  # Filter by class: --class 0, or --class 0 2 3
+        agnostic_nms=False,  # Class-agnostic NMS
+        augment=False,  # Augmented inference
+        visualize=False,  # Visualize features
+        update=False,  # Update all models
+        project=ROOT / 'runs/track',  # Save results to project/name
+        name='exp',  # Save results to project/name
+        exist_ok=False,  # Existing project/name ok, do not increment
+        line_thickness=3,  # Bounding box thickness (pixels)
+        hide_labels=False,  # Hide labels
+        hide_conf=False,  # Hide confidences
+        hide_class=False,  # Hide IDs
+        half=False,  # Use FP16 half-precision inference
+        dnn=False,  # Use OpenCV DNN for ONNX inference
 ):
 
+    # Set the device if not specified
+    if not device:
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    device = torch.device(device)  # Convert to torch.device
+
     source = str(source)
-    save_img = not nosave and not source.endswith('.txt')  # save inference images
-    is_file = Path(source).suffix[1:] in (VID_FORMATS)
+    save_img = not nosave and not source.endswith('.txt')  # Save inference images
+    is_file = Path(source).suffix[1:] in VID_FORMATS
     is_url = source.lower().startswith(('rtsp://', 'rtmp://', 'http://', 'https://'))
     webcam = source.isnumeric() or source.endswith('.txt') or (is_url and not is_file)
     if is_url and is_file:
-        source = check_file(source)  # download
+        source = check_file(source)  # Download
 
     # Directories
-    if not isinstance(yolo_weights, list):  # single yolo model
-        exp_name = yolo_weights.stem
-    elif type(yolo_weights) is list and len(yolo_weights) == 1:  # single models after --yolo_weights
-        exp_name = Path(yolo_weights[0]).stem
-        yolo_weights = Path(yolo_weights[0])
-    else:  # multiple models after --yolo_weights
-        exp_name = 'ensemble'
-    exp_name = name if name else exp_name + "_" + strong_sort_weights.stem
-    save_dir = increment_path(Path(project) / exp_name, exist_ok=exist_ok)  # increment run
+    exp_name = name if name else Path(yolo_model).stem
+    save_dir = increment_path(Path(project) / exp_name, exist_ok=exist_ok)  # Increment run
     save_dir = Path(save_dir)
-    (save_dir / 'tracks' if save_txt else save_dir).mkdir(parents=True, exist_ok=True)  # make dir
+    (save_dir / 'tracks' if save_txt else save_dir).mkdir(parents=True, exist_ok=True)  # Make directory
 
-    # Load model
-    device = select_device(device)
-    
-    WEIGHTS.mkdir(parents=True, exist_ok=True)
-    model = attempt_load(Path(yolo_weights), map_location=device)  # load FP32 model
-    names, = model.names,
-    stride = model.stride.max().cpu().numpy()  # model stride
-    imgsz = check_img_size(imgsz[0], s=stride)  # check image size
+    # Load YOLO model using ultralytics
+    model = YOLO(yolo_model)  # Automatically downloads the model if not available locally
 
-    # Dataloader
-    if webcam:
-        show_vid = check_imshow()
-        cudnn.benchmark = True  # set True to speed up constant image size inference
-        dataset = LoadStreams(source, img_size=imgsz, stride=stride)
-        nr_sources = len(dataset.sources)
-    else:
-        dataset = LoadImages(source, img_size=imgsz, stride=stride)
-        nr_sources = 1
-    vid_path, vid_writer, txt_path = [None] * nr_sources, [None] * nr_sources, [None] * nr_sources
-
-    # initialize StrongSORT
+    # Initialize StrongSORT
     cfg = get_config()
-    cfg.merge_from_file(opt.config_strongsort)
+    cfg.merge_from_file(config_strongsort)
 
-    # Create as many strong sort instances as there are video sources
     strongsort_list = []
-    for i in range(nr_sources):
+    for i in range(1):  # Assuming single source for simplicity
         strongsort_list.append(
             StrongSORT(
                 strong_sort_weights,
@@ -153,161 +191,106 @@ def run(
                 nn_budget=cfg.STRONGSORT.NN_BUDGET,
                 mc_lambda=cfg.STRONGSORT.MC_LAMBDA,
                 ema_alpha=cfg.STRONGSORT.EMA_ALPHA,
-
             )
         )
         strongsort_list[i].model.warmup()
-    outputs = [None] * nr_sources
-    
-    colors = [[random.randint(0, 255) for _ in range(3)] for _ in names]
 
+    # Define dataset
+    if webcam:
+        # Webcam or video stream
+        dataset = cv2.VideoCapture(int(source) if source.isnumeric() else source)
+    elif is_file:
+        # Single video file
+        dataset = cv2.VideoCapture(source)
+    else:
+        raise ValueError(f"Unsupported source type: {source}")
+    
     # Run tracking
-    dt, seen = [0.0, 0.0, 0.0, 0.0], 0
-    curr_frames, prev_frames = [None] * nr_sources, [None] * nr_sources
-    for frame_idx, (path, im, im0s, vid_cap) in enumerate(dataset):
-        s = ''
-        t1 = time_synchronized()
+    while dataset.isOpened():
+        ret, im0s = dataset.read()
+        if not ret:
+            break
+
+        # Preprocess image
+        im = cv2.resize(im0s, imgsz)  # Resize to inference size
+        im = im[:, :, ::-1].transpose(2, 0, 1)  # BGR to RGB, to 3x416x416
+        im = np.ascontiguousarray(im)
+
         im = torch.from_numpy(im).to(device)
         im = im.half() if half else im.float()  # uint8 to fp16/32
-        im /= 255.0  # 0 - 255 to 0.0 - 1.0
-        if len(im.shape) == 3:
-            im = im[None]  # expand for batch dim
-        t2 = time_synchronized()
-        dt[0] += t2 - t1
+        im /= 255.0  # Normalize to 0.0 - 1.0
 
         # Inference
-        visualize = increment_path(save_dir / Path(path[0]).stem, mkdir=True) if visualize else False
-        pred = model(im)
-        t3 = time_synchronized()
-        dt[1] += t3 - t2
+        results = model(im, conf=conf_thres, iou=iou_thres, classes=classes, agnostic_nms=agnostic_nms)
 
-        # Apply NMS
-        pred = non_max_suppression(pred[0], conf_thres, iou_thres, classes, agnostic_nms)
-        dt[2] += time_synchronized() - t3
-        
         # Process detections
-        for i, det in enumerate(pred):  # detections per image
-            seen += 1
-            if webcam:  # nr_sources >= 1
-                p, im0, _ = path[i], im0s[i].copy(), dataset.count
-                p = Path(p)  # to Path
-                s += f'{i}: '
-                txt_file_name = p.name
-                save_path = str(save_dir / p.name) + str(i)  # im.jpg, vid.mp4, ...
-            else:
-                p, im0, _ = path, im0s.copy(), getattr(dataset, 'frame', 0)
-                p = Path(p)  # to Path
-                # video file
-                if source.endswith(VID_FORMATS):
-                    txt_file_name = p.stem
-                    save_path = str(save_dir / p.name)  # im.jpg, vid.mp4, ...
-                # folder with imgs
-                else:
-                    txt_file_name = p.parent.name  # get folder name containing current img
-                    save_path = str(save_dir / p.parent.name)  # im.jpg, vid.mp4, ...
-
-            curr_frames[i] = im0
-
-            txt_path = str(save_dir / 'tracks' / txt_file_name)  # im.txt
-            s += '%gx%g ' % im.shape[2:]  # print string
-            imc = im0.copy() if save_crop else im0  # for save_crop
-
-            if cfg.STRONGSORT.ECC:  # camera motion compensation
-                strongsort_list[i].tracker.camera_update(prev_frames[i], curr_frames[i])
-
+        for i, det in enumerate(results):  # Iterate over predictions
+            det = det.boxes.data  # Access the bounding boxes, confidence, and class labels
             if det is not None and len(det):
-                # Rescale boxes from img_size to im0 size
-                det[:, :4] = scale_coords(im.shape[2:], det[:, :4], im0.shape).round()
 
-                # Print results
-                for c in det[:, -1].unique():
-                    n = (det[:, -1] == c).sum()  # detections per class
-                    s += f"{n} {names[int(c)]}{'s' * (n > 1)}, "  # add to string
+                # Clone the tensor to avoid in-place updates
+                det_clone = det.clone()
 
+                # Rescale boxes from YOLO input size to original image size
+                det_clone[:, :4] = scale_coords(im.shape[1:], det_clone[:, :4], im0s.shape[:2]).round()
+
+                # Extract bounding boxes, confidences, and class labels
                 xywhs = xyxy2xywh(det[:, 0:4])
                 confs = det[:, 4]
                 clss = det[:, 5]
 
-                # pass detections to strongsort
-                t4 = time_synchronized()
-                outputs[i] = strongsort_list[i].update(xywhs.cpu(), confs.cpu(), clss.cpu(), im0)
-                t5 = time_synchronized()
-                dt[3] += t5 - t4
+                # Pass detections to StrongSORT
+                outputs = strongsort_list[i].update(xywhs.cpu(), confs.cpu(), clss.cpu(), im0s)
 
-                # draw boxes for visualization
-                if len(outputs[i]) > 0:
-                    for j, (output, conf) in enumerate(zip(outputs[i], confs)):
-    
+                # Draw boxes and labels
+                if len(outputs) > 0:
+                    for j, (output, conf) in enumerate(zip(outputs, confs)):
                         bboxes = output[0:4]
                         id = output[4]
                         cls = output[5]
 
-                        if save_txt:
-                            # to MOT format
-                            bbox_left = output[0]
-                            bbox_top = output[1]
-                            bbox_w = output[2] - output[0]
-                            bbox_h = output[3] - output[1]
-                            # Write MOT compliant results to file
-                            with open(txt_path + '.txt', 'a') as f:
-                                f.write(('%g ' * 10 + '\n') % (frame_idx + 1, id, bbox_left,  # MOT format
-                                                               bbox_top, bbox_w, bbox_h, -1, -1, -1, i))
+                        label = f"{id} {model.names[int(cls)]} {conf:.2f}"
+                        plot_one_box(bboxes, im0s, label=label, color=(255, 0, 0), line_thickness=2)
 
-                        if save_vid or save_crop or show_vid:  # Add bbox to image
-                            c = int(cls)  # integer class
-                            id = int(id)  # integer id
-                            label = None if hide_labels else (f'{id} {names[c]}' if hide_conf else \
-                                (f'{id} {conf:.2f}' if hide_class else f'{id} {names[c]} {conf:.2f}'))
-                            plot_one_box(bboxes, im0, label=label, color=colors[int(cls)], line_thickness=2)
-                            if save_crop:
-                                txt_file_name = txt_file_name if (isinstance(path, list) and len(path) > 1) else ''
-                                save_one_box(bboxes, imc, file=save_dir / 'crops' / txt_file_name / names[c] / f'{id}' / f'{p.stem}.jpg', BGR=True)
+        # Show video if enabled
+        if show_vid:
+            cv2.imshow('Tracking', im0s)
+            if cv2.waitKey(1) == ord('q'):  # Press 'q' to quit
+                break
 
-                print(f'{s}Done. YOLO:({t3 - t2:.3f}s), StrongSORT:({t5 - t4:.3f}s)')
+    dataset.release()
+    cv2.destroyAllWindows()
 
-            else:
-                strongsort_list[i].increment_ages()
-                print('No detections')
-
-            # Stream results
-            if show_vid:
-                cv2.imshow(str(p), im0)
-                cv2.waitKey(1)  # 1 millisecond
-
-            # Save results (image with detections)
-            if save_vid:
-                if vid_path[i] != save_path:  # new video
-                    vid_path[i] = save_path
-                    if isinstance(vid_writer[i], cv2.VideoWriter):
-                        vid_writer[i].release()  # release previous video writer
-                    if vid_cap:  # video
-                        fps = vid_cap.get(cv2.CAP_PROP_FPS)
-                        w = int(vid_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-                        h = int(vid_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                    else:  # stream
-                        fps, w, h = 30, im0.shape[1], im0.shape[0]
-                    save_path = str(Path(save_path).with_suffix('.mp4'))  # force *.mp4 suffix on results videos
-                    vid_writer[i] = cv2.VideoWriter(save_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (w, h))
-                vid_writer[i].write(im0)
-
-            prev_frames[i] = curr_frames[i]
-
-    # Print results
-    t = tuple(x / seen * 1E3 for x in dt)  # speeds per image
-    print(f'Speed: %.1fms pre-process, %.1fms inference, %.1fms NMS, %.1fms strong sort update per image at shape {(1, 3, imgsz, imgsz)}' % t)
-    if save_txt or save_vid:
-        s = f"\n{len(list(save_dir.glob('tracks/*.txt')))} tracks saved to {save_dir / 'tracks'}" if save_txt else ''
-        print(f"Results saved to {colorstr('bold', save_dir)}{s}")
-    if update:
-        strip_optimizer(yolo_weights)  # update model (to fix SourceChangeWarning)
-
+def increment_path(path, exist_ok=False, sep='', mkdir=False):
+    """
+    Increment a file or directory path, i.e. runs/exp --> runs/exp1, runs/exp2, etc.
+    Args:
+        path (str or Path): Path to increment.
+        exist_ok (bool): If True, existing paths are allowed and no incrementing is done.
+        sep (str): Separator to use between the base name and the incrementing number.
+        mkdir (bool): If True, create the directory after incrementing.
+    Returns:
+        Path: Incremented path.
+    """
+    path = Path(path)
+    if path.exists() and not exist_ok:
+        base, suffix = path.stem, path.suffix
+        for n in range(1, 1000):  # Limit to 1000 increments
+            new_path = path.parent / f"{base}{sep}{n}{suffix}"
+            if not new_path.exists():
+                if mkdir:
+                    new_path.mkdir(parents=True, exist_ok=True)
+                return new_path
+    if mkdir:
+        path.mkdir(parents=True, exist_ok=True)
+    return path
 
 def parse_opt():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--yolo-weights', nargs='+', type=str, default=WEIGHTS / 'yolov7.pt', help='model.pt path(s)')
+    parser.add_argument('--yolo-model', nargs='+', type=str, default='yolov8n.pt', help='model.pt path(s)')
     parser.add_argument('--strong-sort-weights', type=str, default=WEIGHTS / 'osnet_x0_25_msmt17.pt')
     parser.add_argument('--config-strongsort', type=str, default='strong_sort/configs/strong_sort.yaml')
-    parser.add_argument('--source', type=str, default='0', help='file/dir/URL/glob, 0 for webcam')  
+    parser.add_argument('--source', type=str, default='0', help='file/dir/URL/glob, 0 for webcam')
     parser.add_argument('--imgsz', '--img', '--img-size', nargs='+', type=int, default=[640], help='inference size h,w')
     parser.add_argument('--conf-thres', type=float, default=0.5, help='confidence threshold')
     parser.add_argument('--iou-thres', type=float, default=0.5, help='NMS IoU threshold')
@@ -319,7 +302,6 @@ def parse_opt():
     parser.add_argument('--save-crop', action='store_true', help='save cropped prediction boxes')
     parser.add_argument('--save-vid', action='store_true', help='save video tracking results')
     parser.add_argument('--nosave', action='store_true', help='do not save images/videos')
-    # class 0 is person, 1 is bycicle, 2 is car... 79 is oven
     parser.add_argument('--classes', nargs='+', type=int, help='filter by class: --classes 0, or --classes 0 2 3')
     parser.add_argument('--agnostic-nms', action='store_true', help='class-agnostic NMS')
     parser.add_argument('--augment', action='store_true', help='augmented inference')
@@ -335,13 +317,11 @@ def parse_opt():
     parser.add_argument('--half', action='store_true', help='use FP16 half-precision inference')
     parser.add_argument('--dnn', action='store_true', help='use OpenCV DNN for ONNX inference')
     opt = parser.parse_args()
-    opt.imgsz *= 2 if len(opt.imgsz) == 1 else 1  # expand
-
+    opt.imgsz *= 2 if len(opt.imgsz) == 1 else 1  # Expand
     return opt
 
 
 def main(opt):
-    check_requirements(requirements=ROOT / 'requirements.txt', exclude=('tensorboard', 'thop'))
     run(**vars(opt))
 
 
