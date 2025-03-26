@@ -68,9 +68,9 @@ def scale_coords(img1_shape, coords, img0_shape, ratio_pad=None):
 
     # Perform out-of-place operations
     coords = coords.clone()  # Clone the tensor to avoid in-place operations
-    coords[:, [0, 2]] = coords[:, [0, 2]] - pad[0]  # x padding
-    coords[:, [1, 3]] = coords[:, [1, 3]] - pad[1]  # y padding
-    coords[:, :4] = coords[:, :4] / gain
+    coords[:, [0, 2]] -= pad[0]  # x padding
+    coords[:, [1, 3]] -= pad[1]  # y padding
+    coords[:, :4] /= gain
     coords[:, :4] = coords[:, :4].clamp(0, max(img0_shape))  # Clip coordinates to image size
     return coords
 
@@ -122,7 +122,7 @@ VID_FORMATS = ('asf', 'avi', 'gif', 'm4v', 'mkv', 'mov', 'mp4', 'mpeg', 'mpg', '
 def run(
         source='0',
         yolo_model='yolov8s.pt',  # Specify the YOLO model name (e.g., yolov8n.pt, yolov8s.pt)
-        strong_sort_weights=WEIGHTS / 'osnet_x0_25_msmt17.pt',  # StrongSORT weights
+        strong_sort_weights=WEIGHTS / 'osnet_x1_0_msmt17.pt',  # StrongSORT weights
         config_strongsort=ROOT / 'strong_sort/configs/strong_sort.yaml',
         imgsz=(640, 640),  # Inference size (height, width)
         conf_thres=0.25,  # Confidence threshold
@@ -212,13 +212,22 @@ def run(
             break
 
         # Preprocess image
-        im = cv2.resize(im0s, imgsz)  # Resize to inference size
+        h0, w0 = im0s.shape[:2]  # Original height and width
+        r = min(imgsz[0] / h0, imgsz[1] / w0)  # Resize ratio (new / old)
+
+        # Compute padding
+        new_unpad = int(round(w0 * r)), int(round(h0 * r))
+        dw, dh = imgsz[1] - new_unpad[0], imgsz[0] - new_unpad[1]  # Wh padding
+        dw, dh = dw // 2, dh // 2  # Divide padding into 2 sides
+
+        # Resize and pad image
+        im = cv2.resize(im0s, new_unpad, interpolation=cv2.INTER_LINEAR)    
+        im = cv2.copyMakeBorder(im, dh, dh, dw, dw, cv2.BORDER_CONSTANT, value=(114, 114, 114))  # Add padding
         im = im[:, :, ::-1].transpose(2, 0, 1)  # BGR to RGB, to 3x416x416
         im = np.ascontiguousarray(im)
 
         im = torch.from_numpy(im).to(device)
-        im = im.half() if half else im.float()  # uint8 to fp16/32
-        im /= 255.0  # Normalize to 0.0 - 1.0
+        im = im.float() / 255.0  # Normalize to 0.0 - 1.0
 
         # Inference
         results = model(im, conf=conf_thres, iou=iou_thres, classes=classes, agnostic_nms=agnostic_nms)
@@ -232,12 +241,12 @@ def run(
                 det_clone = det.clone()
 
                 # Rescale boxes from YOLO input size to original image size
-                det_clone[:, :4] = scale_coords(im.shape[1:], det_clone[:, :4], im0s.shape[:2]).round()
+                det_clone[:, :4] = scale_coords((imgsz[0], imgsz[1]), det_clone[:, :4], im0s.shape[:2], (r, (dw, dh))).round()
 
                 # Extract bounding boxes, confidences, and class labels
-                xywhs = xyxy2xywh(det[:, 0:4])
-                confs = det[:, 4]
-                clss = det[:, 5]
+                xywhs = xyxy2xywh(det_clone[:, 0:4])
+                confs = det_clone[:, 4]
+                clss = det_clone[:, 5]
 
                 # Pass detections to StrongSORT
                 outputs = strongsort_list[i].update(xywhs.cpu(), confs.cpu(), clss.cpu(), im0s)
